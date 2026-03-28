@@ -120,7 +120,27 @@ function normalizeRuntimeIdentifier(value) {
   }
 
   const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
+  if (trimmed.length === 0) return null;
+
+  // VS Code Marketplace target names differ from .NET RIDs.
+  // Map is inline (not module-scope) to avoid the temporal dead zone — this
+  // function is called at line 13 during module evaluation, before any
+  // module-scope `const` declared later in the file would be initialized.
+  //
+  // VS Code target  →  .NET RID
+  //   win32-x64    →  win-x64
+  //   win32-arm64  →  win-arm64
+  //   darwin-x64   →  osx-x64
+  //   darwin-arm64 →  osx-arm64
+  //   linux-*      →  linux-* (unchanged)
+  const vsCodeTargetToRid = {
+    'win32-x64': 'win-x64',
+    'win32-arm64': 'win-arm64',
+    'darwin-x64': 'osx-x64',
+    'darwin-arm64': 'osx-arm64',
+  };
+
+  return vsCodeTargetToRid[trimmed] ?? trimmed;
 }
 
 function copyDirectory(sourceDir, destinationDir) {

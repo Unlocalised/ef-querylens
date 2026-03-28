@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json.schemastore.org/vsix-publish",
+  "categories": [ "Coding", "Other" ],
+  "identity": {
+    "internalName": "EFQueryLensVS"
+  },
+  "overview": "README.md",
+  "priceCategory": "free",
+  "publisher": "EFQueryLens",
+  "private": false,
+  "qna": false,
+  "repo": "https://github.com/querylenshq/ef-querylens",
+  "tags": [ "EF Core", "Entity Framework", "SQL", "LINQ", "DbContext", "C#", "Productivity" ]
+}

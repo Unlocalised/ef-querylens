@@ -14,14 +14,14 @@ EF QueryLens for Visual Studio provides hover-based SQL preview and quick SQL ac
 
 ## Screenshots
 
-![EF QueryLens Visual Studio Single Query](https://raw.githubusercontent.com/nemina47/ef-querylens/main/docs/assets/vs_extension_single_query.png)
+![EF QueryLens Visual Studio Single Query](https://raw.githubusercontent.com/querylenshq/ef-querylens/main/docs/assets/vs_extension_single_query.png)
 
-![EF QueryLens Visual Studio Multi Query](https://raw.githubusercontent.com/nemina47/ef-querylens/main/docs/assets/vs_extension_multi_query.png)
+![EF QueryLens Visual Studio Multi Query](https://raw.githubusercontent.com/querylenshq/ef-querylens/main/docs/assets/vs_extension_multi_query.png)
 
 ## Requirements
 
 - Visual Studio 2022 (17.14+)
-- .NET 10 Runtime + ASP.NET Core Runtime (required to run the bundled QueryLens backend)
+- .NET 8 or later runtime (10 recommended; the extension uses RollForward so 8 / 9 / 10 all work)
 - .NET 10 SDK (only for local development/build)
 - EF Core project
 
@@ -33,5 +33,5 @@ dotnet build src/Plugins/ef-querylens-visualstudio/EFQueryLens.VisualStudio/EFQu
 
 ## More
 
-- Repository: https://github.com/nemina47/ef-querylens
-- Docs: https://github.com/nemina47/ef-querylens/tree/main/docs
+- Repository: https://github.com/querylenshq/ef-querylens
+- Docs: https://github.com/querylenshq/ef-querylens/tree/main/docs

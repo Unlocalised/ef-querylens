@@ -46,7 +46,7 @@ jobs:
         # Updates package.json version without creating a git commit or tag.
         # vsce package reads the version from package.json, so this is how we
         # keep the published version in sync with the git tag.
-        run: npm version ${{ steps.version.outputs.VERSION }} --no-git-tag-version
+        run: npm version ${{ steps.version.outputs.VERSION }} --no-git-tag-version --allow-same-version
 
       - name: Copy changelog into extension directory
         # vsce reads CHANGELOG.md from the extension root and surfaces it on the
@@ -62,7 +62,6 @@ jobs:
         # inherited by the hook so prepare-runtime publishes the correct RID.
         run: |
           npx --yes @vscode/vsce package \
-            --pre-release \
             --target ${{ matrix.target }} \
             -o ef-querylens-vscode-${{ matrix.target }}.vsix
 
@@ -70,10 +69,10 @@ jobs:
         working-directory: src/Plugins/ef-querylens-vscode
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        # --target is already embedded in the VSIX manifest from the package step;
+        # passing it again alongside --packagePath (-i) is an error in vsce.
         run: |
           npx --yes @vscode/vsce publish \
-            --pre-release \
-            --target ${{ matrix.target }} \
             -i ef-querylens-vscode-${{ matrix.target }}.vsix \
             --pat "$VSCE_PAT"
 
@@ -130,14 +129,51 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Inject version into vsixmanifest
+        shell: pwsh
+        # Updates Identity.Version and d:ReleaseNotes in the VSIX manifest so both
+        # the published version and the release notes link match the git tag.
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          $manifestPath = Resolve-Path "src\Plugins\ef-querylens-visualstudio\EFQueryLens.VisualStudio\source.extension.vsixmanifest"
+          $xml = [xml](Get-Content $manifestPath)
+          $xml.PackageManifest.Metadata.Identity.Version = $version
+          $ns = @{ d = "http://schemas.microsoft.com/developer/vsx-schema-design/2011" }
+          $releaseNotes = Select-Xml -Xml $xml -XPath "//d:ReleaseNotes" -Namespace $ns
+          if ($releaseNotes) {
+            $releaseNotes.Node.InnerText = "https://github.com/querylenshq/ef-querylens/releases/tag/v$version"
+          }
+          $xml.Save($manifestPath)
+          Write-Host "Set VSIX version to $version"
+
       - name: Build Visual Studio extension
-        run: dotnet build src/Plugins/ef-querylens-visualstudio/EFQueryLens.VisualStudio/EFQueryLens.VisualStudio.csproj -c Debug
+        run: dotnet build src/Plugins/ef-querylens-visualstudio/EFQueryLens.VisualStudio/EFQueryLens.VisualStudio.csproj -c Release
+
+      - name: Publish to Visual Studio Marketplace
+        shell: pwsh
+        env:
+          VS_MARKETPLACE_PAT: ${{ secrets.VS_MARKETPLACE_PAT }}
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsixPublisher = & $vswhere -latest -find "VSSDK\VisualStudioIntegration\Tools\Bin\VsixPublisher.exe"
+          $vsix = Get-Item "src\Plugins\ef-querylens-visualstudio\EFQueryLens.VisualStudio\bin\Release\net472\*.vsix" | Select-Object -First 1
+          $manifest = Resolve-Path "src\Plugins\ef-querylens-visualstudio\publishManifest.json"
+          Write-Host "Publishing $($vsix.FullName)"
+          & $vsixPublisher publish `
+            -payload $vsix.FullName `
+            -publishManifest $manifest `
+            -personalAccessToken "$env:VS_MARKETPLACE_PAT"
 
       - name: Upload Visual Studio artifact
         uses: actions/upload-artifact@v7
         with:
           name: ef-querylens-visualstudio
-          path: src/Plugins/ef-querylens-visualstudio/EFQueryLens.VisualStudio/bin/Debug/net472/*.vsix
+          path: src/Plugins/ef-querylens-visualstudio/EFQueryLens.VisualStudio/bin/Release/net472/*.vsix
 
   release:
     runs-on: ubuntu-latest

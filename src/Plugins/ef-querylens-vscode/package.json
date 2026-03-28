@@ -4,16 +4,16 @@
   "description": "Preview your EF Core SQL in real time, without leaving your IDE.",
   "icon": "icon.png",
   "preview": true,
-  "version": "0.0.2",
+  "version": "1.0.6",
   "publisher": "EFQueryLens",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/nemina47/ef-querylens.git"
+    "url": "https://github.com/querylenshq/ef-querylens.git"
   },
-  "homepage": "https://github.com/nemina47/ef-querylens",
+  "homepage": "https://github.com/querylenshq/ef-querylens",
   "bugs": {
-    "url": "https://github.com/nemina47/ef-querylens/issues"
+    "url": "https://github.com/querylenshq/ef-querylens/issues"
   },
   "keywords": [
     "ef-core",
@@ -23,7 +23,7 @@
     "csharp"
   ],
   "engines": {
-    "vscode": "^1.80.0"
+    "vscode": "^1.110.0"
   },
   "categories": [
     "Formatters",
