@@ -5,7 +5,7 @@
   <p>
     <a href="https://marketplace.visualstudio.com/items?itemName=EFQueryLens.ef-querylens-vscode"><img src="https://img.shields.io/visual-studio-marketplace/v/EFQueryLens.ef-querylens-vscode?label=VS%20Code&color=0098FF" alt="VS Code Marketplace Version" /></a>
     <a href="https://marketplace.visualstudio.com/items?itemName=EFQueryLens.EFQueryLensVS"><img src="https://img.shields.io/visual-studio-marketplace/v/EFQueryLens.EFQueryLensVS?label=Visual%20Studio&color=5C2D91" alt="Visual Studio Marketplace Version" /></a>
-    <a href="https://plugins.jetbrains.com/plugin/30753-ef-querylens"><img src="https://img.shields.io/badge/Rider-Under%20Review-orange" alt="Rider Marketplace Review" /></a>
+    <a href="https://plugins.jetbrains.com/plugin/30753-ef-querylens"><img src="https://img.shields.io/jetbrains/plugin/v/30753?label=Rider&color=FF318C" alt="Rider Plugin Version" /></a>
     <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT License" />
   </p>
 </div>
