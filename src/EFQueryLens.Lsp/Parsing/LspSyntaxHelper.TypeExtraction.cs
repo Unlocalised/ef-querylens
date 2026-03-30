@@ -119,7 +119,12 @@ public static partial class LspSyntaxHelper
             // Skip parameters whose declared type contains an open generic type parameter name.
             if (openTypeParams is not null &&
                 openTypeParams.Any(tp => typeName.Contains(tp, StringComparison.Ordinal)))
+            {
+                // Log: parameter skipped due to open generic type reference
+                System.Diagnostics.Debug.WriteLine(
+                    $"[LspSyntaxHelper] skip-param name={paramName} type={typeName} contains-open-generic");
                 continue;
+            }
 
             result[paramName] = typeName;
         }
@@ -157,6 +162,11 @@ public static partial class LspSyntaxHelper
 
             // new() — target type unknown without semantic model
             ImplicitObjectCreationExpressionSyntax => null,
+            
+            // condition ? trueExpr : falseExpr — infer from true branch (should match false)
+            ConditionalExpressionSyntax conditional 
+                => TryInferTypeFromInitializer(conditional.WhenTrue) 
+                   ?? TryInferTypeFromInitializer(conditional.WhenFalse),
 
             // 5, 5L, 5.0f, "str", true, false, ...
             LiteralExpressionSyntax literal => literal.Kind() switch
@@ -172,16 +182,27 @@ public static partial class LspSyntaxHelper
             // $"..." is always System.String
             InterpolatedStringExpressionSyntax => "string",
 
-            // TypeName.Property — heuristic: PascalCase receiver is likely a type
+            // TypeName.Property — heuristic: PascalCase receiver is likely a type.
+            // Skip known static utility classes (e.g. Math.PI) for the same reason as
+            // the InvocationExpressionSyntax arm below: emitting "Math" as a type name
+            // causes the evaluator to block stub generation for the variable entirely.
             MemberAccessExpressionSyntax { Expression: IdentifierNameSyntax receiver }
                 when IsProbablyTypeName(receiver.Identifier.ValueText)
+                  && !IsKnownStaticUtilityClass(receiver.Identifier.ValueText)
                 => receiver.Identifier.ValueText,
 
             // TypeName.Method(...)
+            // Only emit a type name when the receiver looks like a concrete instance type,
+            // not a static BCL utility class (Math, Convert, Enum, etc.). Static types
+            // cannot be instantiated as stubs, so returning their name here causes the
+            // evaluator to skip the variable entirely and then fail with an unknown-variable
+            // error. Returning null lets numeric/heuristic synthesis handle paging variables
+            // like `var page = Math.Max(...)` or `var clamped = Math.Clamp(...)`.
             InvocationExpressionSyntax
             {
                 Expression: MemberAccessExpressionSyntax { Expression: IdentifierNameSyntax receiver2 }
             } when IsProbablyTypeName(receiver2.Identifier.ValueText)
+                  && !IsKnownStaticUtilityClass(receiver2.Identifier.ValueText)
                 => receiver2.Identifier.ValueText,
 
             _ => null,
@@ -200,4 +221,21 @@ public static partial class LspSyntaxHelper
 
     private static bool IsProbablyTypeName(string identifier) =>
         !string.IsNullOrEmpty(identifier) && char.IsUpper(identifier[0]);
+
+    // Well-known BCL static utility classes whose methods return primitives or unrelated
+    // types. When an initializer like `var page = Math.Max(...)` is encountered, inferring
+    // the type as "Math" would cause the evaluator to skip stub generation for the variable.
+    // Returning null here lets numeric/heuristic synthesis produce a correct int/decimal stub.
+    private static readonly HashSet<string> _knownStaticUtilityClasses = new(StringComparer.Ordinal)
+    {
+        "Math", "Convert", "Enum", "BitConverter", "Buffer",
+        "GC", "GCSettings", "Environment", "Console",
+        "Path", "File", "Directory", "Interlocked",
+        "Monitor", "Mutex", "Semaphore", "Thread",
+        "Activator", "Marshal", "RuntimeHelpers",
+        "Regex", "Encoding", "Uri",
+    };
+
+    private static bool IsKnownStaticUtilityClass(string identifier) =>
+        _knownStaticUtilityClasses.Contains(identifier);
 }

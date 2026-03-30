@@ -311,6 +311,96 @@ public class TypeExtractionTests
         Assert.Equal("System.Guid", typeName);
     }
 
+    [Fact]
+    public void ExtractLocalVariableTypes_VarWithConditionalIntLiterals_IsInferredAsInt()
+    {
+        var source = """
+            var count = true ? 5 : 10;
+            _ = count;
+            """;
+
+        var types = Extract(source, "_ = count;");
+
+        Assert.True(types.TryGetValue("count", out var typeName));
+        Assert.Equal("int", typeName);
+    }
+
+    [Fact]
+    public void ExtractLocalVariableTypes_VarWithConditionalStringLiterals_IsInferredAsString()
+    {
+        var source = """
+            var name = true ? "hello" : "world";
+            _ = name;
+            """;
+
+        var types = Extract(source, "_ = name;");
+
+        Assert.True(types.TryGetValue("name", out var typeName));
+        Assert.Equal("string", typeName);
+    }
+
+    [Fact]
+    public void ExtractLocalVariableTypes_VarWithConditionalCastAndLiteral_IsInferredFromCast()
+    {
+        var source = """
+            var value = true ? (long)5 : 10;
+            _ = value;
+            """;
+
+        var types = Extract(source, "_ = value;");
+
+        Assert.True(types.TryGetValue("value", out var typeName));
+        Assert.Equal("long", typeName);
+    }
+
+    // ─── Static utility class initializers ───────────────────────────────────
+
+    [Fact]
+    public void ExtractLocalVariableTypes_VarWithMathMax_DoesNotInferMathAsType()
+    {
+        // var page = Math.Max(request.Page, 1) — type must NOT be reported as "Math".
+        // The evaluator would treat "Math" as a static class and skip stub generation,
+        // causing an unknown-variable compilation error on the page variable.
+        var source = """
+            var page = Math.Max(request.Page, 1);
+            _ = page;
+            """;
+
+        var types = Extract(source, "_ = page;");
+
+        if (types.TryGetValue("page", out var typeName))
+            Assert.NotEqual("Math", typeName);
+        // If absent entirely that's also fine — evaluator numeric heuristics handle it.
+    }
+
+    [Fact]
+    public void ExtractLocalVariableTypes_VarWithMathClamp_DoesNotInferMathAsType()
+    {
+        var source = """
+            var pageSize = Math.Clamp(request.PageSize, 1, 200);
+            _ = pageSize;
+            """;
+
+        var types = Extract(source, "_ = pageSize;");
+
+        if (types.TryGetValue("pageSize", out var typeName))
+            Assert.NotEqual("Math", typeName);
+    }
+
+    [Fact]
+    public void ExtractLocalVariableTypes_VarWithConvertToInt32_DoesNotInferConvertAsType()
+    {
+        var source = """
+            var count = Convert.ToInt32(someValue);
+            _ = count;
+            """;
+
+        var types = Extract(source, "_ = count;");
+
+        if (types.TryGetValue("count", out var typeName))
+            Assert.NotEqual("Convert", typeName);
+    }
+
     // ─── Edge cases ───────────────────────────────────────────────────────────
 
     [Fact]

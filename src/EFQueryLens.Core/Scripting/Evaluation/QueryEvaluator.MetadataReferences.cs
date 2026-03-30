@@ -49,7 +49,25 @@ public sealed partial class QueryEvaluator
                 if (string.IsNullOrEmpty(loc) || !seen.Add(loc))
                     continue;
 
+                // Skip RID-specific runtime assets (runtimes/<rid>/...).
+                // For Roslyn compilation, these can introduce duplicate/alternate
+                // metadata graphs that surface internal provider implementation types
+                // (for example SqlClient SNI internals) as CS0122 errors.
+                var normalizedLoc = loc.Replace('\\', '/');
+                if (normalizedLoc.Contains("/runtimes/", StringComparison.OrdinalIgnoreCase))
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[QL-Eval] metadata-ref-skip-rid location={loc}");
+                    continue;
+                }
+
                 var name = asm.GetName().Name;
+                if (ShouldSkipMetadataReferenceAssembly(name))
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[QL-Eval] metadata-ref-skip-compiler name={name} location={loc}");
+                    continue;
+                }
 
                 // Keep System.Linq.Queryable aligned with the major version of
                 // System.Linq.Expressions to avoid mixed framework reference graphs.
@@ -83,7 +101,40 @@ public sealed partial class QueryEvaluator
             }
         }
 
+        // Bring in System.Data references only when missing, and align to the same
+        // framework directory as System.Linq.Expressions to avoid mixed-reference graphs.
+        EnsureFrameworkReferenceBySimpleName("System.Data.Common", expressionsDir, refs, seen, seenNames);
+        EnsureFrameworkReferenceBySimpleName("System.Data", expressionsDir, refs, seen, seenNames);
+
         return refs;
+    }
+
+    private static bool ShouldSkipMetadataReferenceAssembly(string? assemblyName)
+    {
+        if (string.IsNullOrWhiteSpace(assemblyName))
+            return false;
+
+        // Compiler/analyzer assemblies are not needed for script compilation and can
+        // surface internal Roslyn types (for example NullableWalker) as CS0122 diagnostics.
+        return assemblyName.StartsWith("Microsoft.CodeAnalysis", StringComparison.Ordinal);
+    }
+
+    private static void EnsureFrameworkReferenceBySimpleName(
+        string simpleName,
+        string? frameworkDir,
+        ICollection<MetadataReference> refs,
+        ISet<string> seenPaths,
+        ISet<string> seenNames)
+    {
+        if (seenNames.Contains(simpleName) || string.IsNullOrWhiteSpace(frameworkDir))
+            return;
+
+        var candidate = Path.Combine(frameworkDir, $"{simpleName}.dll");
+        if (!File.Exists(candidate) || !seenPaths.Add(candidate))
+            return;
+
+        refs.Add(MetadataReference.CreateFromFile(candidate));
+        seenNames.Add(simpleName);
     }
 
     private static string ComputeAssemblySetHash(List<Assembly> assemblies)

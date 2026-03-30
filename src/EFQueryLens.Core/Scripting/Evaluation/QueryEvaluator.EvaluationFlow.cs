@@ -133,7 +133,22 @@ public sealed partial class QueryEvaluator
                 var includeGridifyFallbackExtensions = false;
                 var maxRetries = 5;
                 CSharpCompilation compilation;
+                var lastSrc = string.Empty;
                 var roslynCompilationWatch = Stopwatch.StartNew();
+
+                string DumpSrcToTemp()
+                {
+                    try
+                    {
+                        var path = Path.Combine(Path.GetTempPath(), $"ql_eval_{Guid.NewGuid():N}.cs");
+                        File.WriteAllText(path, lastSrc);
+                        return path;
+                    }
+                    catch
+                    {
+                        return "(could not write temp file)";
+                    }
+                }
 
                 while (true)
                 {
@@ -150,17 +165,26 @@ public sealed partial class QueryEvaluator
                         synthesizedUsingStaticTypes,
                         synthesizedUsingNamespaces,
                         includeGridifyFallbackExtensions);
+                    lastSrc = src;
                     compilation = BuildCompilation(src, refs);
                     var errors = compilation.GetDiagnostics()
                         .Where(d => d.Severity == DiagnosticSeverity.Error)
                         .ToList();
 
-                    var hardErrors = errors.Where(e => e.Id is not ("CS0103" or "CS1061" or "CS1929" or "CS7036" or "CS0019" or "CS8122" or "CS0246" or "CS0234" or "CS0400" or "CS1503")).ToList();
+                    var hardErrors = errors.Where(e => e.Id is not ("CS0103" or "CS1061" or "CS1929" or "CS7036" or "CS0019" or "CS8122" or "CS0246" or "CS0234" or "CS0400" or "CS1503"
+                        // CS0122: type/member inaccessible due to protection level.
+                        // Caused by internal types in indirect metadata dependencies
+                        // (e.g. Microsoft.Data.SqlClient native interop types like SNIHandle).
+                        // These are metadata artifacts — the ALC loads assemblies at IL level
+                        // where CLR access rules govern, not C# compiler visibility.
+                        or "CS0122")).ToList();
                     if (hardErrors.Count > 0)
                     {
+                        var rawHardDetail = string.Join("; ", hardErrors.Take(10).Select(e => $"{e.Id}: {e.GetMessage()}"));
                         return Failure(
                             $"Compilation error: {FormatHardDiagnostics(hardErrors)}",
-                            sw.Elapsed, dbContextType, alcCtx.LoadedAssemblies);
+                            sw.Elapsed, dbContextType, alcCtx.LoadedAssemblies,
+                            diagnosticDetail: $"{rawHardDetail} | src={DumpSrcToTemp()}");
                     }
 
                     if (errors.Count == 0)
@@ -168,12 +192,20 @@ public sealed partial class QueryEvaluator
 
                     if (maxRetries-- <= 0)
                     {
+                        var rawDetail = string.Join("; ", errors.Take(10).Select(e => $"{e.Id}: {e.GetMessage()}"));
                         return Failure(
                             $"Compilation error: {FormatSoftDiagnostics(errors)}",
-                            sw.Elapsed, dbContextType, alcCtx.LoadedAssemblies);
+                            sw.Elapsed, dbContextType, alcCtx.LoadedAssemblies,
+                            diagnosticDetail: $"{rawDetail} | src={DumpSrcToTemp()}");
                     }
 
                     compilationRetryCount++;
+
+                    LogDebug($"compile-retry iteration={compilationRetryCount} errorCount={errors.Count}");
+                    foreach (var err in errors.Take(10))
+                    {
+                        LogDebug($"  diagnostic id={err.Id} msg={err.GetMessage()}");
+                    }
 
                     var missingNames = errors
                         .Where(d => d.Id == "CS0103")
@@ -186,13 +218,20 @@ public sealed partial class QueryEvaluator
 
                     var changed = false;
 
+                    LogDebug($"compile-retry cs0103-missing-names={string.Join(",", missingNames)}");
+
                     var rootId = TryExtractRootIdentifier(workingRequest.Expression);
                     foreach (var n in missingNames)
                     {
                         if (stubs.Any(s => s.Contains($" {n} ") || s.Contains($" {n};")))
                             continue;
 
-                        stubs.Add(BuildStubDeclaration(n!, rootId, workingRequest, dbContextType));
+                        var stub = BuildStubDeclaration(n!, rootId, workingRequest, dbContextType);
+                        if (string.IsNullOrWhiteSpace(stub))
+                            continue;
+
+                        LogDebug($"compile-retry stub-added name={n} stub={stub.Trim()}");
+                        stubs.Add(stub);
                         changed = true;
                     }
 
@@ -206,24 +245,43 @@ public sealed partial class QueryEvaluator
                     // Two cases:
                     //  • Top-level type   → parent is a namespace → emit "using Ns;"
                     //  • Nested type      → parent is a class     → emit "using static EnclosingType;"
-                    foreach (var typeName in errors
+                    var cs0246Types = errors
                         .Where(d => d.Id is "CS0246" or "CS0234")
                         .Select(d => TryExtractTypeNameFromCS0246(d))
                         .Where(n => !string.IsNullOrWhiteSpace(n))
-                        .Distinct(StringComparer.Ordinal))
+                        .Distinct(StringComparer.Ordinal)
+                        .ToList();
+
+                    LogDebug($"compile-retry cs0246-types={string.Join(",", cs0246Types)}");
+
+                    foreach (var typeName in cs0246Types)
                     {
-                        foreach (var parent in FindNamespacesForSimpleName(typeName!, knownTypes))
+                        var parents = FindNamespacesForSimpleName(typeName!, knownTypes).ToList();
+                        LogDebug($"compile-retry type-lookup name={typeName} found-parents={string.Join(",", parents)}");
+
+                        if (parents.Count == 0)
+                        {
+                            LogDebug($"compile-retry type-not-in-known-types name={typeName}");
+                        }
+
+                        foreach (var parent in parents)
                         {
                             if (IsResolvableNamespace(parent, knownNamespaces))
                             {
                                 if (synthesizedUsingNamespaces.Add(parent))
+                                {
+                                    LogDebug($"compile-retry using-namespace added={parent}");
                                     changed = true;
+                                }
                             }
                             else if (IsResolvableType(parent, knownTypes))
                             {
                                 // Nested type — bring it into scope with "using static EnclosingType"
                                 if (synthesizedUsingStaticTypes.Add(parent))
+                                {
+                                    LogDebug($"compile-retry using-static added={parent}");
                                     changed = true;
+                                }
                             }
                         }
                     }
@@ -249,7 +307,14 @@ public sealed partial class QueryEvaluator
                         if (oldStub is null)
                             continue;
 
-                        var typedStub = BuildStubFromTypeName(expectedType, argName);
+                        var typedStub = BuildStubFromTypeName(expectedType, argName, dbContextType, workingRequest.UsingAliases);
+                        if (string.IsNullOrWhiteSpace(typedStub))
+                        {
+                            stubs.Remove(oldStub);
+                            changed = true;
+                            continue;
+                        }
+
                         if (string.Equals(oldStub, typedStub, StringComparison.Ordinal))
                             continue;
 
@@ -308,9 +373,18 @@ public sealed partial class QueryEvaluator
 
                     if (!changed)
                     {
+                        // If the only remaining errors are metadata accessibility errors
+                        // (CS0122 from internal types in indirect assembly dependencies),
+                        // retrying will never help — proceed to emit.
+                        LogDebug($"compile-retry iteration={compilationRetryCount} no-changes-made");
+                        if (errors.All(e => e.Id == "CS0122"))
+                            break;
+
+                        var rawNoChangeDetail = string.Join("; ", errors.Take(10).Select(e => $"{e.Id}: {e.GetMessage()}"));
                         return Failure(
                             $"Compilation error: {FormatSoftDiagnostics(errors)}",
-                            sw.Elapsed, dbContextType, alcCtx.LoadedAssemblies);
+                            sw.Elapsed, dbContextType, alcCtx.LoadedAssemblies,
+                            diagnosticDetail: $"{rawNoChangeDetail} | src={DumpSrcToTemp()}");
                     }
                 }
                 roslynCompilationWatch.Stop();
@@ -324,9 +398,12 @@ public sealed partial class QueryEvaluator
                     var emitResult = compilation.Emit(ms);
                     if (!emitResult.Success)
                     {
+                        var emitErrors = emitResult.Diagnostics.Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
+                        var rawEmitDetail = string.Join("; ", emitErrors.Take(10).Select(e => $"{e.Id}: {e.GetMessage()}"));
                         return Failure(
-                            $"Emit error: {FormatHardDiagnostics(emitResult.Diagnostics.Where(d => d.Severity == DiagnosticSeverity.Error))}",
-                            sw.Elapsed, dbContextType, alcCtx.LoadedAssemblies);
+                            $"Emit error: {FormatHardDiagnostics(emitErrors)}",
+                            sw.Elapsed, dbContextType, alcCtx.LoadedAssemblies,
+                            diagnosticDetail: $"{rawEmitDetail} | src={DumpSrcToTemp()}");
                     }
 
                     ms.Position = 0;

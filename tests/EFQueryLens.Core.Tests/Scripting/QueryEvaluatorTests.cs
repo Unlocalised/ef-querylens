@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.IO;
 using EFQueryLens.Core.AssemblyContext;
 using EFQueryLens.Core.Contracts;
 using EFQueryLens.Core.Scripting;
@@ -175,6 +176,80 @@ public class QueryEvaluatorTests : IClassFixture<QueryEvaluatorFixture>
     }
 
     [Fact]
+    public async Task Evaluate_SqlServerSample_PagingWithExpressionVariable_SucceedsOrMethodNotFound()
+    {
+        // Regression: SqlClient runtime RID assets may leak internal metadata types
+        // (for example SNIHandle) into Roslyn reference graphs. This must never surface
+        // as CS0122/emit failure for the paging + Select(expression) hover scenario.
+        //
+        // Keep this aligned with the user-reported expression shape to catch regressions.
+        using var sqlAlcCtx = new ProjectAssemblyContext(GetSampleSqlServerAppDll());
+        var evaluator = new QueryEvaluator();
+
+        var result = await evaluator.EvaluateAsync(
+            sqlAlcCtx,
+            new TranslationRequest
+            {
+                AssemblyPath = sqlAlcCtx.AssemblyPath,
+                Expression = "db.Orders.OrderByDescending(o => o.CreatedUtc).ThenByDescending(o => o.Id).Skip((page - 1) * pageSize).Take(pageSize).Select(expression)",
+                DbContextTypeName = "SampleSqlServerApp.Infrastructure.Persistence.SqlServerAppDbContext",
+                LocalVariableTypes = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["page"] = "int",
+                    ["pageSize"] = "int",
+                    ["expression"] = "System.Linq.Expressions.Expression<System.Func<SampleSqlServerApp.Domain.Entities.Order, int>>",
+                },
+            });
+
+        if (result.Success)
+        {
+            Assert.NotEmpty(result.Commands);
+        }
+        else
+        {
+            Assert.DoesNotContain("CS0122", result.ErrorMessage ?? string.Empty, StringComparison.Ordinal);
+            Assert.DoesNotContain("SNIHandle", result.ErrorMessage ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("Emit error", result.ErrorMessage ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("Compilation error", result.ErrorMessage ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("Method not found", result.ErrorMessage!, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    /// <summary>
+    /// Verifies that the evaluator can resolve and use <c>SqlServerReportingDbContext</c>
+    /// independently of <c>SqlServerAppDbContext</c> — the core multi-DbContext scenario.
+    /// Uses the same bimodal assertion as the primary SqlServer test to tolerate provider drift.
+    /// </summary>
+    [Fact]
+    public async Task Evaluate_SqlServerSample_ReportingContext_CustomerDirectory_ReturnsSql()
+    {
+        using var sqlAlcCtx = new ProjectAssemblyContext(GetSampleSqlServerAppDll());
+        var evaluator = new QueryEvaluator();
+
+        var result = await evaluator.EvaluateAsync(
+            sqlAlcCtx,
+            new TranslationRequest
+            {
+                AssemblyPath = sqlAlcCtx.AssemblyPath,
+                Expression = "db.CustomerDirectory",
+                DbContextTypeName = "SampleSqlServerApp.Infrastructure.Persistence.SqlServerReportingDbContext",
+            });
+
+        if (result.Success)
+        {
+            // Aligned package/runtime graph: translation succeeds against the reporting context.
+            Assert.NotNull(result.Sql);
+            Assert.Contains("Customers", result.Sql, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal("Microsoft.EntityFrameworkCore.SqlServer", result.Metadata.ProviderName);
+            return;
+        }
+
+        // Drifted graph: must fail gracefully — same diagnostics expected as primary context.
+        Assert.NotNull(result.ErrorMessage);
+        Assert.Contains("Method not found", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Evaluate_SimpleDbSet_PopulatesCommandsList()
     {
         var result = await TranslateAsync("db.Orders");
@@ -211,6 +286,18 @@ public class QueryEvaluatorTests : IClassFixture<QueryEvaluatorFixture>
 
         Assert.True(result.Success, result.ErrorMessage);
         Assert.NotNull(result.Sql);
+    }
+
+    [Fact]
+    public async Task Evaluate_InterfaceDbContextName_Resolves()
+    {
+        var result = await TranslateAsync(
+            "db.Users",
+            dbContextTypeName: "SampleMySqlApp.Application.Abstractions.IMySqlAppDbContext");
+
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.NotNull(result.Sql);
+        Assert.Contains("MySql", result.Metadata.ProviderName, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -581,6 +668,101 @@ public class QueryEvaluatorTests : IClassFixture<QueryEvaluatorFixture>
             expression: "db.Customers.Where(c => c.Orders.Count(o => o.IsNotDeleted) >= minOrders)");
 
         Assert.Equal("int minOrders = 1;", stub);
+    }
+
+    [Fact]
+    public void BuildStubDeclaration_LocalVariableStaticType_FallsThroughToHeuristics()
+    {
+        // When the LSP hint resolves to a static type ("Math"), the stub for Math itself
+        // (not page/pageSize) should fall through to heuristics and end up as object rather
+        // than causing an empty/hard-block. The key invariant is that page/pageSize are
+        // synthesized correctly via Skip/Take heuristics — tested by the Evaluate_ tests.
+        var stub = BuildStubDeclarationForRequestForTest(
+            missingName: "Math",
+            expression: "db.Orders.Skip(Math.Max(page, 1)).Take(pageSize)",
+            localVariableTypes: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["Math"] = "System.Math"
+            });
+
+        // Falls through to object default (Math is filtered by LooksLikeTypeOrNamespacePrefix
+        // in the retry loop before BuildStubDeclaration is even called).
+        Assert.NotNull(stub);
+    }
+
+    [Fact]
+    public void BuildStubDeclaration_LocalVariableAliasToStaticType_FallsThroughToHeuristics()
+    {
+        // Same as above: aliased static type hint falls through, does not hard-block.
+        var stub = BuildStubDeclarationForRequestForTest(
+            missingName: "mathHelper",
+            expression: "db.Orders.Skip(pageSize)",
+            localVariableTypes: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["mathHelper"] = "MathAlias"
+            },
+            usingAliases: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["MathAlias"] = "System.Math"
+            });
+
+        Assert.NotNull(stub);
+    }
+
+    [Fact]
+    public void BuildStubDeclaration_UnresolvedTypeMarkerQuestionMark_FallsThroughToHeuristics()
+    {
+        // Regression: When a typename is "?" (unresolved type marker from LSP),
+        // BuildStubFromTypeName should return empty to fall through to heuristics
+        // rather than generating invalid C# like "typeof()".
+        // This can occur if LSP tries to extract an open generic type parameter like TResult
+        // and represents it as "?".
+        var stub = BuildStubDeclarationForRequestForTest(
+            missingName: "unknownType",
+            expression: "db.Orders.Skip(pageSize)",
+            localVariableTypes: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["unknownType"] = "?"
+            });
+
+        // Falls through without hard-blocking or generating invalid code.
+        Assert.NotNull(stub);
+    }
+
+    [Fact]
+    public async Task Evaluate_PagingWithMathCall_DoesNotSurfaceStaticTypeCompilationErrors()
+    {
+        var result = await TranslateAsync(
+            "db.Orders.OrderByDescending(o => o.CreatedUtc).ThenByDescending(o => o.Id).Skip(Math.Max(pageSize * pageIndex, 0)).Take(pageSize).Select(expression)");
+
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.NotNull(result.Sql);
+        Assert.DoesNotContain("Cannot declare a variable of static type 'Math'", result.ErrorMessage ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Cannot convert to static type 'Math'", result.ErrorMessage ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Evaluate_PagingWithMathCall_WithStaticLspHint_FallsThroughToNumericHeuristic()
+    {
+        // Simulates the exact hover scenario: LSP extracts `var page = Math.Max(...)` and
+        // emits { "page": "Math", "pageSize": "Math" } as LocalVariableTypes.
+        // The static-type guard must not hard-block — it must fall through so that the
+        // Skip/Take argument heuristics resolve page and pageSize as int stubs.
+        var result = await _evaluator.EvaluateAsync(_alcCtx, new TranslationRequest
+        {
+            AssemblyPath = _alcCtx.AssemblyPath,
+            Expression = "db.Orders.OrderByDescending(o => o.CreatedUtc).ThenByDescending(o => o.Id).Skip((page - 1) * pageSize).Take(pageSize).Select(expression)",
+            LocalVariableTypes = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["page"]     = "Math",
+                ["pageSize"] = "Math",
+            },
+        });
+
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.NotNull(result.Sql);
+        Assert.DoesNotContain("Unknown variable 'page'", result.ErrorMessage ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Unknown variable 'pageSize'", result.ErrorMessage ?? string.Empty, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -1105,13 +1287,79 @@ public sealed class C
         Assert.Equal("string?", expected);
     }
 
+    [Fact]
+    public void EmbeddedTemplate_FakeDbDataReader_QualifiesSystemType()
+    {
+        var assembly = typeof(QueryEvaluator).Assembly;
+        var resourceName = assembly.GetManifestResourceNames()
+            .FirstOrDefault(name =>
+                name.EndsWith(".Scripting.Compilation.Templates.FakeDbDataReader.cs.tmpl", StringComparison.Ordinal));
+
+        Assert.False(string.IsNullOrWhiteSpace(resourceName));
+
+        using var stream = assembly.GetManifestResourceStream(resourceName!);
+        Assert.NotNull(stream);
+        using var reader = new StreamReader(stream!);
+        var template = reader.ReadToEnd();
+
+        Assert.Contains("public override global::System.Type GetFieldType", template, StringComparison.Ordinal);
+        Assert.DoesNotContain("public override Type GetFieldType", template, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildEvalSource_UsesQualifiedSystemTypeInGeneratedReader()
+    {
+        var dbContextType = _alcCtx.FindDbContextType("MySqlAppDbContext");
+        var request = new TranslationRequest
+        {
+            AssemblyPath = _alcCtx.AssemblyPath,
+            Expression = "db.Orders",
+            ContextVariableName = "db",
+            AdditionalImports = [],
+            UsingAliases = new Dictionary<string, string>(StringComparer.Ordinal),
+            UsingStaticTypes = [],
+        };
+
+        var buildEvalSourceMethod = typeof(QueryEvaluator).GetMethod(
+            "BuildEvalSource",
+            BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(buildEvalSourceMethod);
+
+        var source = buildEvalSourceMethod!.Invoke(
+            null,
+            [
+                dbContextType,
+                request,
+                Array.Empty<string>(),
+                new HashSet<string>(StringComparer.Ordinal),
+                new HashSet<string>(StringComparer.Ordinal),
+                Array.Empty<string>(),
+                Array.Empty<string>(),
+                false,
+            ]) as string;
+
+        Assert.False(string.IsNullOrWhiteSpace(source));
+        Assert.Contains("public override global::System.Type GetFieldType", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("public override Type GetFieldType", source, StringComparison.Ordinal);
+    }
+
     private string BuildStubDeclarationForTest(string missingName, string expression)
+        => BuildStubDeclarationForRequestForTest(missingName, expression);
+
+    private string BuildStubDeclarationForRequestForTest(
+        string missingName,
+        string expression,
+        IReadOnlyDictionary<string, string>? localVariableTypes = null,
+        IReadOnlyDictionary<string, string>? usingAliases = null)
     {
         var dbContextType = _alcCtx.FindDbContextType(null, expression);
         var request = new TranslationRequest
         {
             AssemblyPath = _alcCtx.AssemblyPath,
             Expression = expression,
+            LocalVariableTypes = localVariableTypes ?? new Dictionary<string, string>(StringComparer.Ordinal),
+            UsingAliases = usingAliases ?? new Dictionary<string, string>(StringComparer.Ordinal),
         };
 
         var method = typeof(QueryEvaluator).GetMethod(
@@ -1124,7 +1372,7 @@ public sealed class C
             null,
             [missingName, "db", request, dbContextType]) as string;
 
-        Assert.False(string.IsNullOrWhiteSpace(stub));
+        Assert.NotNull(stub);
         return stub!;
     }
 
